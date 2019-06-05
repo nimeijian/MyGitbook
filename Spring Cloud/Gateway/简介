@@ -6,3 +6,5 @@
 那么这有什么意义呢？先对 Spring Cloud Gateway 内部的组件有整体的印象。
 
 在官方提供的实例项目 spring-cloud-gateway-sample ，我们看到 GatewaySampleApplication 上有 @EnableAutoConfiguration 注解。因为该项目导入了 spring-cloud-gateway-core 依赖库，它会扫描 Spring Cloud Gateway 的配置。
+
+你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，你好，
