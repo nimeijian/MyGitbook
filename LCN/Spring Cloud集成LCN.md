@@ -1,0 +1,47 @@
+请参考：[https://www.txlcn.org/zh-cn/docs/start.html](https://www.txlcn.org/zh-cn/docs/start.html)。
+
+LCN分为客户端TC和服务端TM，TC集成在我们微服务中以SDK的形式与TM进行交互。要使用LCN，需要先启动TM服务，然后在我们的微服务里集成TC。
+# 一、启动TM服务
+TM依赖JRE1.8+、MySQL5.6+/MariaDB10+、Redis3.2+。
+为了保证TM服务的整体高可用性，MySQL/MariaDB、Redis和TM本身都请配置高可用集群。
+对于MySQL/MariaDB集群，由于这里并发性并不高，数据量也不大，但需要高可用，故MySQL/MariaDB集群建议直接通过MySQL5.7+/MariaDB10.1+自带的无损复制方式（MySQL5.7+/MariaDB10.1+默认的半同步方式）部署一主一从或一主两从集群，考虑到主服务器的单点故障，可以使用haproxy或keepalived等HA中间件对主从服务器做failover高可用，若再考虑到HA中间件本身的高可用性，可在HA中间件上再使用Zookeeper。
+对于redis集群，基于同样的考虑，这里Redis集群不需要做哈希槽分片，建议直接使用sentienl模式做一主一从或一主两从高可用集群。
+对于TM集群，TM服务器之间通过共享同一套MySQL/MariaDB、Redis环境做到集群数据共享。
+
+TM服务器的部署过程：
+## 1、安装中间件
+安装TM依赖的中间件： JRE1.8+, Mysql5.6+, Redis3.2+
+## 2、建库建表
+建库tx-manager，并建表t_tx_exception
+| **CREATE **DATABASE IF **NOT EXISTS  **`tx-manager` **DEFAULT **CHARSET utf8 **COLLATE **utf8_general_ci;  USE `tx-manager`;    **SET NAMES **utf8mb4;  **SET **FOREIGN_KEY_CHECKS = 0;    **DROP TABLE **IF **EXISTS **`t_tx_exception`;  **CREATE TABLE **`t_tx_exception`  (    **`id` **bigint(20) **NOT NULL **AUTO_INCREMENT,    **`group_id` ****varchar**(64) **CHARACTER SET **utf8mb4 **COLLATE **utf8mb4_general_ci **NULL DEFAULT NULL**,    **`unit_id` ****varchar**(32) **CHARACTER SET **utf8mb4 **COLLATE **utf8mb4_general_ci **NULL DEFAULT NULL**,    **`mod_id` ****varchar**(128) **CHARACTER SET **utf8mb4 **COLLATE **utf8mb4_general_ci **NULL DEFAULT NULL**,    **`transaction_state` **tinyint(4) **NULL DEFAULT NULL**,    **`registrar` **tinyint(4) **NULL DEFAULT NULL**,    **`ex_state` **tinyint(4) **NULL DEFAULT NULL **COMMENT **'0 待处理 1已处理'**,    **`remark` ****varchar**(10240) **NULL DEFAULT NULL **COMMENT **'备注'**,    **`create_time` **datetime(0) **NULL DEFAULT NULL**,    **PRIMARY KEY **(**`id`**) **USING **BTREE  ) ENGINE = InnoDB AUTO_INCREMENT = 967 **CHARACTER SET **= utf8mb4 **COLLATE **= utf8mb4_general_ci ROW_FORMAT = Dynamic;    **SET **FOREIGN_KEY_CHECKS = 1;   | 
+|----|
+## 3、下载源码并打包
+| **# git   clone **[http://gitlab.yzf.net/assembly/yzf-lcn.git](http://gitlab.yzf.net/assembly/yzf-lcn.git)** & cd txlcn-tm**  **# mvn   clean  package -Dmaven.test.skip=true**   | 
+|----|
+## 4、配置Apollo
+| spring.application.name = txlcn-tm  server.port = 7970    # TxClient连接请求端口  tx-lcn.manager.port = 8070  tx-lcn.manager.dtx-time = 30000    spring.datasource.driver-class-name = com.mysql.jdbc.Driver  spring.datasource.url = jdbc:mysql://172.23.60.5:5688/tx-manager?useUnicode=true&allowMultiQueries=true&characterEncoding=utf-8&zeroDateTimeBehavior=convertToNull  spring.datasource.username = root  spring.datasource.password = root123456  spring.jpa.database-platform = org.hibernate.dialect.MySQL5InnoDBDialect    mybatis.configuration.map-underscore-to-camel-case = true  mybatis.configuration.use-generated-keys = true    spring.redis.sentinel.master = mymaster  spring.redis.sentinel.nodes = 172.24.28.1:26379,172.24.28.2:26379,172.24.28.3:26379  #spring.redis.host = 172.22.0.39  #spring.redis.port = 6379    eureka.client.serviceUrl.defaultZone = [http://172.23.60.6:9090/eureka/](http://172.23.60.6:9090/eureka/)  tc.servers = accounting-voucher-service,accounting-account-info   | 
+|----|
+请根据实际环境进行配置。
+## 5、启动TM服务
+java -jar txlcn-tm-5.0.2-RELEASE.jar &
+# 二、微服务集成TC
+## 1、引入pom依赖
+在微服务的pom文件中引入LCN的TC侧jar包：
+| <dependency>      <groupId>com.codingapi.txlcn</groupId>       <artifactId>txlcn-tc</artifactId>       <version>5.0.2-RELEASE</version>   </dependency>        <dependency>       <groupId>com.codingapi.txlcn</groupId>      <artifactId>txlcn-txmsg-netty</artifactId>      <version>5.0.2-RELEASE</version>   </dependency>      | 
+|----|
+## 2、开启分布式事务
+在微服务的启动类上加上@EnableDistributedTransaction注解开启分布式事务功能。
+| **@SpringBootApplication**  **@EnableDistributedTransaction**  **public class ****DemoAApplication**{  **    public static void ****main**(String[] args) {        SpringApplication.run(DemoDubboClientApplication.class,   args);    }  }      | 
+|----|
+## 3、使用分布式事务
+在需要使用分布式事务的方法上加上@LcnTransaction/@TccTransaction/@TxcTransaction注解和Spring自身的@Transactional注解以使用分布式事务，该链路涉及到的所有系统的入口service层方法上都需要加上这些注解。
+| **@Service**  **public class ****ServiceA**{   ** @Autowired**   ** private**ValueDaovalueDao; *//本地db操作*   **    @Autowired**  **    private**ServiceBserviceB;*//远程B模块业务*   **    @LcnTransaction***//分布式事务注解*  **    @Transactional***//本地事务注解*  **    public** String **execute**(String value) **throws**BusinessException{  *        // step1. call remote service B*          String result =   serviceB.rpc(value);  *// (1)*   *        // step2. local store operate. DTX   commit if save success, rollback if not.*          valueDao.save(value);  *// (2)*          valueDao.saveBackup(value);  *// (3)*  **        return** result + "   > " + "ok-A";      }  }    | 
+|----|
+## 4、配置注册中心
+在各服务的Apollo中加入以下配置以发现TM服务：
+eureka.client.serviceUrl.defaultZone = [http://172.23.0.203:8761/eureka/](http://172.23.0.203:8761/eureka/)
+
+注意事项
+1）业务代码发生异常后需要抛出来让LCN框架感知到，不能吞掉；
+2）根据Spring的工作机制，try/finally并不会回滚本地事务，导致也不会回滚分布式事务，需要在catch里继续往上抛异常；
+3）根据﻿@孙井权﻿ 的实际使用情况，发现在LCN模式下，在同一个分布式事务中，后面读取不到前面已经提交的数据，可以在同一个分布式事务的前面将值设置到本次分布式事务的上下文中，后面从该上下文中取，同一个分布式事务是共享上下文的，且事务之间的上下文是相互隔离的。

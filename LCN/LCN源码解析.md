@@ -1,62 +1,1184 @@
-在分析LCN的源码之前，我们先看下LCN的工作原理，以下是其工作原理图：（请参考\[https://www.txlcn.org/zh-cn/docs/principle/control.html\]\(https://www.txlcn.org/zh-cn/docs/principle/control.html\)）
-
-!\[图片\]\(https://uploader.shimo.im/f/uh5iec2n2XorMc26.png!thumbnail\)
-
+在分析LCN的源码之前，我们先看下LCN的工作原理，以下是其工作原理图：（请参考[https://www.txlcn.org/zh-cn/docs/principle/control.html](https://www.txlcn.org/zh-cn/docs/principle/control.html)）
+![图片](https://uploader.shimo.im/f/uh5iec2n2XorMc26.png!thumbnail)
 核心步骤
-
 1、创建事务组
-
 是指在事务发起方开始执行业务代码之前先调用TxManager创建事务组对象，然后拿到事务标示GroupId的过程。
-
 2、加入事务组
-
 添加事务组是指参与方在执行完业务方法以后，将该模块的事务信息通知给TxManager的操作。
-
 3、通知事务组
-
 是指在发起方执行完业务代码以后，将发起方执行结果状态通知给TxManager,TxManager将根据事务最终状态和事务组的信息来通知相应的参与模块提交或回滚事务，并返回结果给事务发起方。
 
-
-
 本文按照这三步的时序对LCN的核心源码进行解读（为了突出核心流程，其它代码会忽略）。
-
 LCN框架支持LCN/TCC/TXC三种模式，本文按照LCN、TCC和TXC的顺序一一分析。
-
 LCN版本：5.0.2-RELEASE。
-
-\# 一、LCN模式
-
-LCN模式的工作原理为通过代理java.sql.Connection，在发起方和参与方commit/rollback本地事务时什么都不做，最后由协调器TM通知各参与方commit/rollback本地事务。（请参考\[https://www.txlcn.org/zh-cn/docs/principle/lcn.html\]\(https://www.txlcn.org/zh-cn/docs/principle/lcn.html\)）
-
-\#\# 1、创建事务组
-
+# 一、LCN模式
+LCN模式的工作原理为通过代理java.sql.Connection，在发起方和参与方commit/rollback本地事务时什么都不做，最后由协调器TM通知各参与方commit/rollback本地事务。（请参考[https://www.txlcn.org/zh-cn/docs/principle/lcn.html](https://www.txlcn.org/zh-cn/docs/principle/lcn.html)）
+## 1、创建事务组
 我们假设有两个系统：ServiceA和ServiceB，其中ServiceA为分布式事务的发起方，ServiceB为分布式事务的参与方，ServiceA调用ServiceB的服务。创建事务组由发起方ServiceA发起，这部分我们分析发起方创建事务组的逻辑。
 
+入口TransactionAspect.runWithLcnTransaction():
+```
+@Around("lcnTransactionPointcut() && !txcTransactionPointcut()" +
+        "&& !tccTransactionPointcut() && !txTransactionPointcut()")
+public Object runWithLcnTransaction(ProceedingJoinPoint point) throws Throwable {
+    DTXInfo dtxInfo = DTXInfo.getFromCache(point);
+    LcnTransaction lcnTransaction = dtxInfo.getBusinessMethod().getAnnotation(LcnTransaction.class);
+    dtxInfo.setTransactionType(Transactions.LCN);
+    dtxInfo.setTransactionPropagation(lcnTransaction.propagation());
+    dtxInfo.setTimeout(lcnTransaction.timeout());
+    return dtxLogicWeaver.runTransaction(dtxInfo, point::proceed);
+}
+```
+可见，LCN框架是通过切面的方式给加了@LcnTransaction等注解的方法织入分布式事务的。我们跟进dtxLogicWeaver.runTransaction()，来到DTXServiceExecutor.transactionRunning()方法:
+```
+public Object transactionRunning(TxTransactionInfo info) throws Throwable {
+	try {
+        // 忽略。。。
+        
+		dtxLocalControl.preBusinessCode(info);
+
+		// 4.3 执行业务
+		Object result = dtxLocalControl.doBusinessCode(info);
+      
+		// 4.4 业务执行成功
+		dtxLocalControl.onBusinessCodeSuccess(info, result);
+
+		return result;
+	} catch (TransactionException e) {
+        // 忽略。。。
+	} catch (Throwable e) {
+		// 4.5 业务执行失败
+		dtxLocalControl.onBusinessCodeError(info, e);
+		throw e;
+	} finally {
+		// 4.6 业务执行完毕
+		dtxLocalControl.postBusinessCode(info);
+	}
+}
+```
+可见，LCN框架给分布式事务的生命周期划分了preBusinessCode()、doBusinessCode()、onBusinessCodeSuccess()/onBusinessCodeError()和postBusinessCode()共4个阶段，DTXLocalControl接口的定义为：
+```
+/**
+ *  LCN分布式事务控制
+ * @author lorne
+ */
+public interface DTXLocalControl {
+
+    /**
+     * 业务代码执行前
+     *
+     * @param info info
+     * @throws  TransactionException TransactionException
+     */
+    default void preBusinessCode(TxTransactionInfo info) throws TransactionException {
+
+    }
+
+    /**
+     * 执行业务代码
+     *
+     * @param info info
+     * @return  Object Object
+     * @throws Throwable Throwable
+     */
+    default Object doBusinessCode(TxTransactionInfo info) throws Throwable {
+        return info.getBusinessCallback().call();
+    }
 
 
-入口TransactionAspect.runWithLcnTransaction\(\):
+    /**
+     * 业务代码执行失败
+     *
+     * @param info info
+     * @param throwable throwable
+     * @throws TransactionException TransactionException
+     */
+    default void onBusinessCodeError(TxTransactionInfo info, Throwable throwable) throws TransactionException {
 
-\`\`\`
+    }
 
-@Around\("lcnTransactionPointcut\(\) && !txcTransactionPointcut\(\)" +
+    /**
+     * 业务代码执行成功
+     *
+     * @param info info
+     * @param result result
+     * @throws TransactionException TransactionException
+     */
+    default void onBusinessCodeSuccess(TxTransactionInfo info, Object result) throws TransactionException {
 
-        "&& !tccTransactionPointcut\(\) && !txTransactionPointcut\(\)"\)
+    }
 
-public Object runWithLcnTransaction\(ProceedingJoinPoint point\) throws Throwable {
+    /**
+     * 清场
+     *
+     * @param info info
+     */
+    default void postBusinessCode(TxTransactionInfo info) {
 
-    DTXInfo dtxInfo = DTXInfo.getFromCache\(point\);
+    }
+}
+```
+该接口的实现类有：
+![图片](https://uploader.shimo.im/f/L7ZjFyPs9jsPgcJK.png!thumbnail)
+每种模式都有3个实现类，比如LCN模式有LcnDefaultTransaction、LcnStartingTransaction和LcnRunningTransaction实现类，它们分别对应LCN模式下默认、发起方事务、参与方事务场景下的处理逻辑。
+我们现在分析LCN模式下发起方的事务处理逻辑，即LcnStartingTransaction :
+```
+@Service(value = "control_lcn_starting")
+public class LcnStartingTransaction implements DTXLocalControl {
 
-    LcnTransaction lcnTransaction = dtxInfo.getBusinessMethod\(\).getAnnotation\(LcnTransaction.class\);
+    // 忽略。。。
 
-    dtxInfo.setTransactionType\(Transactions.LCN\);
+    @Override
+    public void preBusinessCode(TxTransactionInfo info) throws TransactionException {
+        // create DTX group
+        transactionControlTemplate.createGroup(info.getGroupId(), info.getUnitId(), info.getTransactionInfo(), info.getTransactionType(), info.getTimeout());
 
-    dtxInfo.setTransactionPropagation\(lcnTransaction.propagation\(\)\);
+        // lcn type need connection proxy
+        DTXLocalContext.makeProxy();
+    }
 
-    dtxInfo.setTimeout\(lcnTransaction.timeout\(\)\);
+    @Override
+    public void onBusinessCodeError(TxTransactionInfo info, Throwable throwable) {
+        DTXLocalContext.cur().setSysTransactionState(0);
+    }
 
-    return dtxLogicWeaver.runTransaction\(dtxInfo, point::proceed\);
+    @Override
+    public void onBusinessCodeSuccess(TxTransactionInfo info, Object result) {
+        DTXLocalContext.cur().setSysTransactionState(1);
+    }
 
+    @Override
+    public void postBusinessCode(TxTransactionInfo info) {
+        // RPC close DTX group
+        transactionControlTemplate.notifyGroup(info.getGroupId(), info.getUnitId(), info.getTransactionType(),  DTXLocalContext.transactionState(globalContext.dtxState(info.getGroupId())));
+    }
+}
+```
+我们依次按照preBusinessCode()、doBusinessCode()、onBusinessCodeError()/onBusinessCodeSuccess()和postBusinessCode()的时序分析各方法的执行逻辑。
+### 1.1 preBusinessCode()
+```
+public void preBusinessCode(TxTransactionInfo info) throws TransactionException {
+	// create DTX group
+	transactionControlTemplate.createGroup(info.getGroupId(), info.getUnitId(), info.getTransactionInfo(), info.getTransactionType(), info.getTimeout());
+
+	// lcn type need connection proxy
+	DTXLocalContext.makeProxy();
+}  
+```
+这里有两个方法，我们先跟进ransactionControlTemplate.createGroup()，来到ReliableMessenger.createGroup()方法：
+```
+public void createGroup(String groupId, long timeout) throws RpcException, LcnBusinessException {
+    // TxManager创建事务组
+    MessageDto messageDto = request(MessageCreator.createGroup(groupId, timeout));
+    if (!MessageUtils.statusOk(messageDto)) {
+        throw new LcnBusinessException(messageDto.loadBean(Throwable.class));
+    }
+}
+```
+
+```
+/**
+ * 强通讯
+ *
+ * @param messageDto            通讯数据
+ * @param whenNonManagerMessage 异常提示
+ * @return MessageDto
+ * @throws RpcException RpcException
+ */
+private MessageDto request(MessageDto messageDto, long timeout, String whenNonManagerMessage) throws RpcException {
+    for (int i = 0; i < rpcClient.loadAllRemoteKey().size() + 1; i++) {
+        try {
+            String remoteKey = rpcClient.loadRemoteKey();
+            MessageDto result = rpcClient.request(remoteKey, messageDto, timeout);
+
+            return result;
+        } catch (RpcException e) {
+            // 忽略。。。
+        }
+}
+```
+
+```
+public MessageDto request(String key, RpcCmd cmd, long timeout) throws RpcException {
+    NettyRpcCmd nettyRpcCmd = (NettyRpcCmd) cmd;
+    log.debug("get channel, key:{}", key);
+    Channel channel = getChannel(key);
+    channel.writeAndFlush(nettyRpcCmd);
+    log.debug("await response");
+    if (timeout < 1) {
+        nettyRpcCmd.await();
+    } else {
+        nettyRpcCmd.await(timeout);
+    }
+    MessageDto res = cmd.loadResult();
+    log.debug("response is: {}", res);
+    nettyRpcCmd.loadRpcContent().clear();
+    return res;
+}
+```
+可见，发起方会构建一条Create Group消息并通过Netty发送给TM。
+我们看下TM侧在接收到Create Group消息后的处理逻辑：
+```
+@Service("rpc_create-group")
+public class CreateGroupExecuteService implements RpcExecuteService {
+
+    // 忽略。。。
+
+    @Override
+    public Serializable execute(TransactionCmd transactionCmd) throws TxManagerException {
+        try {
+            long timeout = (long)transactionCmd.getMsg().getData();
+            transactionManager.begin(transactionCmd.getGroupId(), timeout);
+        } catch (TransactionException e) {
+            throw new TxManagerException(e);
+        }
+        txLogger.txTrace(transactionCmd.getGroupId(), null, "created group");
+        return null;
+    }
+}
+```
+我们跟进transactionManager.begin()方法，最终来到FastStorage.initGroup()方法：
+```
+public void initGroup(String groupId, long timeout) {
+        redisTemplate.opsForHash().put(REDIS_GROUP_PREFIX + groupId, "root", "");
+        timeout = timeout <= 0 ?  managerConfig.getDtxTime() : timeout;
+        redisTemplate.expire(REDIS_GROUP_PREFIX + groupId, timeout, TimeUnit.MILLISECONDS);
+
+        saveDtxTime(groupId, timeout);
+    }
+```
+TM将本分布式事务组groupId存入redis（二级key为root）。
+
+我们继续分析LcnStartingTransaction.preBusinessCode()方法里另一个DTXLocalContext.*makeProxy*()方法：
+```
+/**
+ * 设置代理资源
+ */
+public static void makeProxy() {
+    if (currentLocal.get() != null) {
+        cur().proxyTmp = cur().proxy;
+        cur().proxy = true;
+    }
+}
+```
+这里只是将当前分布式事务上下文里的proxy置为true，该值在获取数据库连接时会用到：
+```
+@Component
+public class DTXResourceWeaver {
+
+    // 忽略。。。    
+
+    public Object getConnection(ConnectionCallback connectionCallback) throws Throwable {
+        DTXLocalContext dtxLocalContext = DTXLocalContext.cur();
+        if (Objects.nonNull(dtxLocalContext) && dtxLocalContext.isProxy()) {
+            String transactionType = dtxLocalContext.getTransactionType();
+            TransactionResourceProxy resourceProxy = txLcnBeanHelper.loadTransactionResourceProxy(transactionType);
+            Connection connection = resourceProxy.proxyConnection(connectionCallback);
+            log.debug("proxy a sql connection: {}.", connection);
+            return connection;
+        }
+        return connectionCallback.call();
+    }
+}
+```
+我们跟进resourceProxy.proxyConnection()方法，来到TCGlobalContext
+.getLcnConnection()方法：
+```
+public LcnConnectionProxy getLcnConnection(String groupId) throws TCGlobalContextException {
+    if (attachmentCache.containsKey(groupId, LcnConnectionProxy.class.getName())) {
+        return attachmentCache.attachment(groupId, LcnConnectionProxy.class.getName());
+    }
+    throw new TCGlobalContextException("non exists lcn connection");
+}
+```
+可见，LCN模式对java.sql.Connection进行了代理，代理类为LcnConnectionProxy：
+```
+public class LcnConnectionProxy implements Connection {
+
+    private Connection connection;
+
+    public LcnConnectionProxy(Connection connection) {
+        this.connection = connection;
+    }
+
+    /**
+     * notify connection
+     *
+     * @param state transactionState
+     * @return RpcResponseState RpcResponseState
+     */
+    public RpcResponseState notify(int state) {
+        try {
+            if (state == 1) {
+                connection.commit();
+            } else {
+                connection.rollback();
+            }
+            connection.close();
+
+            return RpcResponseState.success;
+        } catch (Exception e) {
+
+            return RpcResponseState.fail;
+        }
+    }
+
+    @Override
+    public void setAutoCommit(boolean autoCommit) throws SQLException {
+        connection.setAutoCommit(false);
+    }
+
+    @Override
+    public void commit() throws SQLException {
+        //connection.commit();
+    }
+
+    @Override
+    public void rollback() throws SQLException {
+        //connection.rollback();
+    }
+
+    @Override
+    public void close() throws SQLException {
+        //connection.close();
+    }
+
+	// 忽略。。。
+}
+```
+由该类可知，LCN将java.sql.connection的autoCommit属性设置为false，即关闭了自动提交，由LCN框架来控制commit；并且代理连接的commit()/rollback()/close()方法实现都为空，即本地事务commit/rollback/close时什么都不做，而是由notify()方法控制java.sql.Connection的commit/rollback/close，若state==1则commit本地事务，否则rollback本地事务。
+### 1.2 doBusinessCode
+该方法包括执行ServiceA的本地业务逻辑和ServiceA通过RPC调用ServiceB的服务。
+
+至此，发起方创建了事务组，执行了本地的业务逻辑，并RPC调用了远程参与方ServiceB，按照分布式事务的时序，分布式事务进入到参与方ServiceB，进入到ServiceB后将会先执行其本地业务逻辑，然后向TM发送加入分布式组的消息，第二部分我们分析参与方ServiceB加入分布式事务组的事务织入逻辑。参与方ServiceB执行完后，分布式事务时序回到发起方ServiceA，发起方将向TM发送Notify Group消息并提交本地，TM接收到Notify Group消息后根据消息体中State的值决定向各参与方发送commit命令还是rollback命令（Notify Unit消息），各参与方接收到Notify Unit消息后commit/rollback本地事务，第三部分我们将再回到发起方ServiceA继续分析通知事务组的织入逻辑。
+## 2、加入事务组
+发起方ServiceA发起分布式事务并调用本被调用方ServiceB后，整个分布式事务的时序来到本参与方ServiceB，这部分我们分析参与方ServiceB的加入事务组的事务织入逻辑，按照本文的假设，参与方ServiceB仍使用LCN模式。
+
+入口TransactionAspect.runWithLcnTransaction()：
+```
+@Around("lcnTransactionPointcut() && !txcTransactionPointcut()" +
+        "&& !tccTransactionPointcut() && !txTransactionPointcut()")
+public Object runWithLcnTransaction(ProceedingJoinPoint point) throws Throwable {
+    DTXInfo dtxInfo = DTXInfo.getFromCache(point);
+    LcnTransaction lcnTransaction = dtxInfo.getBusinessMethod().getAnnotation(LcnTransaction.class);
+    dtxInfo.setTransactionType(Transactions.LCN);
+    dtxInfo.setTransactionPropagation(lcnTransaction.propagation());
+    dtxInfo.setTimeout(lcnTransaction.timeout());
+    return dtxLogicWeaver.runTransaction(dtxInfo, point::proceed);
+}
+```
+发起方和各参与方的事务织入入口一致。我们仍然跟进dtxLogicWeaver.runTransaction()方法来到LcnRunningTransaction类:
+```
+@Component("control_lcn_running")
+public class LcnRunningTransaction implements DTXLocalControl {
+    
+    // 忽略。。。
+    
+    @Override
+    public void preBusinessCode(TxTransactionInfo info) {
+        // lcn type need connection proxy
+        DTXLocalContext.makeProxy();
+    }
+    
+    @Override
+    public void onBusinessCodeError(TxTransactionInfo info, Throwable throwable) {
+        try {
+            transactionCleanTemplate.clean(info.getGroupId(), info.getUnitId(), info.getTransactionType(), 0);
+        } catch (TransactionClearException e) {
+
+        }
+    }
+    
+    @Override
+    public void onBusinessCodeSuccess(TxTransactionInfo info, Object result) throws TransactionException {
+        
+        // join DTX group
+        transactionControlTemplate.joinGroup(info.getGroupId(), info.getUnitId(), info.getTransactionType(), info.getTransactionInfo());
+    }
+    
+}
+```
+这里依然按照preBusinessCode()、doBusinessCode()、onBusinessCodeSuccess()/onBusinessCodeError()的顺序依次分析各方法的执行逻辑。
+### 2.1 preBusinessCode()
+```
+public void preBusinessCode(TxTransactionInfo info) {
+    // lcn type need connection proxy
+    DTXLocalContext.makeProxy();
+}
+```
+DTXLocalContext.makeProxy()方法已在第一部分分析过，不再赘述。
+### 2.2 doBusinessCode()
+该方法执行ServiceB的业务逻辑。
+### 2.3 onBusinessCodeError()
+doBusinessCode()方法可能执行成功，也可能执行失败，我们先分析执行失败时的事务执行逻辑。
+```
+public void onBusinessCodeError(TxTransactionInfo info, Throwable throwable) {
+	try {
+		transactionCleanTemplate.clean(info.getGroupId(), info.getUnitId(), info.getTransactionType(), 0);
+	} catch (TransactionClearException e) {
+	}
+}
+```
+我们跟进transactionCleanTemplate.clean()方法（注意这里传入的state为0），最终进入到LcnConnectionProxy.notify(state)方法：
+```
+public RpcResponseState notify(int state) {
+    try {
+        if (state == 1) {
+            connection.commit();
+        } else {
+            connection.rollback();
+        }
+        connection.close();
+        
+        return RpcResponseState.success;
+    } catch (Exception e) {
+        return RpcResponseState.fail;
+    }
+}
+```
+由于这里传入的state==0，故本地分布式事务被rollback，整个分布式事务也将被rollback并结束。
+### 2.4 onBusinessCodeSuccess()
+doBusinessCode()方法执行成功后会进入该方法，我们接下来分析业务逻辑执行成功的逻辑：
+```
+public void onBusinessCodeSuccess(TxTransactionInfo info, Object result) throws TransactionException {
+    // 忽略。。。
+    
+    // join DTX group
+    transactionControlTemplate.joinGroup(info.getGroupId(), info.getUnitId(), info.getTransactionType(), info.getTransactionInfo());
+}
+```
+跟进transactionControlTemplate.joinGroup()方法后发现，ServiceB会向TM发送一条Join Group消息，即加入本分布式事务组。注意，这里只是给TM发送消息，并没有commit本地事务。
+
+我们进入TM侧，看下TM接收到该Join Group消息后的处理逻辑：
+```
+@Service("rpc_join-group")
+public class JoinGroupExecuteService implements RpcExecuteService {
+    // 忽略。。。
+    
+    @Override
+    public Serializable execute(TransactionCmd transactionCmd) throws TxManagerException {
+        try {
+            // 忽略。。。
+            
+            transactionManager.join(dtxContext, joinGroupParams.getUnitId(), joinGroupParams.getUnitType(),                    rpcClient.getAppName(transactionCmd.getRemoteKey()), joinGroupParams.getTransactionState());
+                    
+            // 忽略。。。
+        } catch (TransactionException e) {
+            // 忽略。。。
+        }
+        
+        // 忽略。。。
+    }
+}
+```
+我们跟进transactionManager.join()方法，最终来到FastStorage类：
+```
+public void saveTransactionUnitToGroup(String groupId, TransactionUnit transactionUnit) throws FastStorageException {
+    if (Optional.ofNullable(redisTemplate.hasKey(REDIS_GROUP_PREFIX + groupId)).orElse(false)) {
+        redisTemplate.opsForHash().put(REDIS_GROUP_PREFIX + groupId, transactionUnit.getUnitId(), transactionUnit);
+        return;
+    }
+    throw new FastStorageException("attempts to the non-existent transaction group " + groupId, FastStorageException.EX_CODE_NON_GROUP);
+}
+```
+可见，TM将参与方的UnitId和TransactionUnit信息持久化到redis，并与发起方在同一个groupId下，注意该事务组消息不能redis过期。
+
+至此，参与方ServiceB加入了分布式事务组。第三部分我们回到发起方ServiceA继续看通知事务组的事务织入逻辑。
+## 3、通知事务组
+按照分布式事务的时序，发起方ServiceA先向事务协调器TM创建事务组，然后执行本地业务逻辑，再通过RPC调用参与方ServiceB，执行完后回到ServiceA，ServiceA执行完本地业务逻辑后将给TM发送Notify Group消息，并commit/rollback本地事务，TM接收到Notify Group消息后通知各参与方commit/rollback各自本地事务。下面我们分析这部分的事务织入逻辑。
+我们接第一部分继续分析LcnStartingTransaction类的onBusinessCodeError()/onBusinessCodeSuccess()和postBusinessCode()方法。
+### 3.1 onBusinessCodeError()
+```
+public void onBusinessCodeError(TxTransactionInfo info, Throwable throwable) {
+    DTXLocalContext.cur().setSysTransactionState(0);
+}
+```
+该里将事务上下文的sysTransactionState属性设置为0，该值将会在postBusinessCode()方法里传给TM。
+### 3.2 onBusinessCodeSuccess()
+```
+public void onBusinessCodeSuccess(TxTransactionInfo info, Object result) {
+    DTXLocalContext.cur().setSysTransactionState(1);
+}
+```
+该里将事务上下文的sysTransactionState属性设置为1，该值将会在postBusinessCode()方法里传给TM。
+### 3.3 postBusinessCode()
+不管本地/分布式事务执行成功还失败，发起方一定会执行该方法：
+```
+public void postBusinessCode(TxTransactionInfo info) {
+    // RPC close DTX group
+    transactionControlTemplate.notifyGroup(info.getGroupId(), info.getUnitId(), info.getTransactionType(),        DTXLocalContext.transactionState(globalContext.dtxState(info.getGroupId())));
+}
+```
+其中DTXLocalContext.*transactionState*()方法会取出上一步设置到事务上下文中的sysTransactionState值。我们跟进transactionControlTemplate.notifyGroup()方法：
+```
+public void notifyGroup(String groupId, String unitId, String transactionType, int state) {
+    // 忽略。。。
+    state = reliableMessenger.notifyGroup(groupId, state);
+    transactionCleanTemplate.clean(groupId, unitId, transactionType, state);
+    // 忽略。。。    
+}
+```
+ServiceA会给TM发送Notify Group消息，然后执行clean()方法（并不等待TM返回结果，发起方一旦将该消息发送出去即执行clean()方法），clean()方法我们在第二部分的ServiceB加入分布式事务组的时候分析过，最终会执行connectionProxy.notify(state)方法，commit或rollback发起方的本地事务。
+我们看下TM侧接收到Notify Group消息后的执行逻辑：
+```
+@Service("rpc_notify-group")
+public class NotifyGroupExecuteService implements RpcExecuteService {
+
+    // 忽略。。。
+
+    @Override
+    public Serializable execute(TransactionCmd transactionCmd) throws TxManagerException {
+        try {
+            // 忽略。。。  
+
+            if (commitState == 1) {
+                transactionManager.commit(dtxContext);
+            } else if (commitState == 0) {
+                transactionManager.rollback(dtxContext);
+            }
+
+            return commitState;
+        } catch (TransactionException e) {
+            throw new TxManagerException(e);
+        } finally {
+            transactionManager.close(transactionCmd.getGroupId());
+        }
+    }
+}
+```
+若commitState==1则commit事务，若commitState == 0则rollback事务，该commitState的值即为上面发起方事务上下文中sysTransactionState的值。我们跟进transactionManager.commit()和transactionManager.rollback()方法：
+```
+public void commit(DTXContext dtxContext) throws TransactionException {
+    notifyTransaction(dtxContext, 1);
 }
 
-\`\`\`
+public void rollback(DTXContext dtxContext) throws TransactionException {
+    notifyTransaction(dtxContext, 0);
+}
+```
+这两个方法执行的同一个方法，只是状态不一致，我们继续跟进notifyTransaction()方法：
+```
+private void notifyTransaction(DTXContext dtxContext, int transactionState) throws TransactionException {
+    List<TransactionUnit> transactionUnits = dtxContext.transactionUnits();
 
+    for (TransactionUnit transUnit : transactionUnits) {
+        NotifyUnitParams notifyUnitParams = new NotifyUnitParams();
+        notifyUnitParams.setGroupId(dtxContext.getGroupId());
+        notifyUnitParams.setUnitId(transUnit.getUnitId());
+        notifyUnitParams.setUnitType(transUnit.getUnitType());
+        notifyUnitParams.setState(transactionState);
+
+        try {
+            List<String> modChannelKeys = rpcClient.remoteKeys(transUnit.getModId());
+            if (modChannelKeys.isEmpty()) {
+                // record exception
+                throw new RpcException("offline mod.");
+            }
+            MessageDto respMsg =
+                    rpcClient.request(modChannelKeys.get(0), MessageCreator.notifyUnit(notifyUnitParams));
+            if (!MessageUtils.statusOk(respMsg)) {
+                // 提交/回滚失败的消息处理
+                List<Object> params = Arrays.asList(notifyUnitParams, transUnit.getModId());
+                rpcExceptionHandler.handleNotifyUnitBusinessException(params, respMsg.loadBean(Throwable.class));
+            }
+        } catch (RpcException e) {
+            // 提交/回滚通讯失败
+            List<Object> params = Arrays.asList(notifyUnitParams, transUnit.getModId());
+            rpcExceptionHandler.handleNotifyUnitMessageException(params, e);
+        } finally {
+            txLogger.txTrace(dtxContext.getGroupId(), notifyUnitParams.getUnitId(), "notify unit over");
+        }
+    }
+}
+```
+其执行逻辑为，先从redis中取出当前groupId下的所有参与方的TransactionUnit信息（不包括发起方，发起方在发送Notify Group后即本地commit/rollback了），然后给各参与方（ServiceB）发送notifyUnit消息，通知它们提交或回滚其本地事务。
+我们回到TC侧的参与方ServiceB，看下它接收到notifyUnit消息后的执行逻辑：
+```
+public class DefaultNotifiedUnitService implements RpcExecuteService {
+
+    // 忽略。。。
+
+    @Override
+    public Serializable execute(TransactionCmd transactionCmd) throws TxClientException {
+        try {
+            NotifyUnitParams notifyUnitParams = transactionCmd.getMsg().loadBean(NotifyUnitParams.class);
+            
+            // 忽略。。。
+            
+            // 事务清理操作
+            transactionCleanTemplate.clean(
+                    notifyUnitParams.getGroupId(),
+                    notifyUnitParams.getUnitId(),
+                    notifyUnitParams.getUnitType(),
+                    notifyUnitParams.getState());
+            return true;
+        } catch (TransactionClearException | InterruptedException e) {
+            throw new TxClientException(e);
+        }
+    }
+}
+```
+transactionCleanTemplate.clean()方法我们上面分析过，会根据State的值commit/rollback本地事务。
+
+至此，发起方ServiceA commit/rollback了本地事务，并向TM发送了Notify Group消息，TM接收到该消息后，从redis里取出了该groupId下的所有参与方信息，并向所有的参与方发送了commit/rollback命令，各参与方接收到消息，根据发送的命令commit/rollback本地事务，至此整个分布式事务执行结束。
+# 二、TCC模式
+TCC模式的工作原理与LCN不同，它并不代理java.sql.Connection，而是由业务侧提供Try、Confirm和Cancel方法，TC会先调用Try方法，若所有TC都返回执行成功，事务协调器TM则会通知各参与方执行Confirm方法，否则会通知各参与方执行Cancel方法。（请参考[https://www.txlcn.org/zh-cn/docs/principle/tcc.html](https://www.txlcn.org/zh-cn/docs/principle/tcc.html)）
+这部分在上面LCN模式的基础上对TCC模式的源码进行补充讲解，只讲解与LCN模式不同的地方。TCC与LCN模式的代码在TM侧完全一致，TM侧并不区分模式，TC侧的执行逻辑有以下几点不同。
+## 1、preBusinessCode()
+```
+@Service(value = "control_tcc_starting")
+public class TccStartingTransaction implements DTXLocalControl {
+    // 忽略。。。
+
+    public TccTransactionInfo prepareTccInfo(TxTransactionInfo info) throws TransactionException {
+        Method method = info.getPointMethod();
+        TccTransaction tccTransaction = method.getAnnotation(TccTransaction.class);
+        if (tccTransaction == null) {
+            throw new TransactionException("TCC type need @TccTransaction in " + method.getName());
+        }
+        String cancelMethod = tccTransaction.cancelMethod();
+        String confirmMethod = tccTransaction.confirmMethod();
+        Class<?> executeClass = tccTransaction.executeClass();
+        if (StringUtils.isEmpty(tccTransaction.cancelMethod())) {
+            cancelMethod = "cancel" + StringUtils.capitalize(method.getName());
+        }
+        if (StringUtils.isEmpty(tccTransaction.confirmMethod())) {
+            confirmMethod = "confirm" + StringUtils.capitalize(method.getName());
+        }
+        if (Void.class.isAssignableFrom(executeClass)) {
+            executeClass = info.getTransactionInfo().getTargetClazz();
+        }
+
+        TccTransactionInfo tccInfo = new TccTransactionInfo();
+        tccInfo.setExecuteClass(executeClass);
+        tccInfo.setCancelMethod(cancelMethod);
+        tccInfo.setConfirmMethod(confirmMethod);                    tccInfo.setMethodParameter(info.getTransactionInfo().getArgumentValues());      tccInfo.setMethodTypeParameter(info.getTransactionInfo().getParameterTypes());
+
+        return tccInfo;
+    }
+
+    @Override
+    public void preBusinessCode(TxTransactionInfo info) throws TransactionException {
+        // cache tcc info
+        try {
+            globalContext.tccTransactionInfo(info.getUnitId(), () -> prepareTccInfo(info)).setMethodParameter(info.getTransactionInfo().getArgumentValues());
+        } catch (Throwable throwable) {
+            throw new TransactionException(throwable);
+        }
+        
+        // 忽略。。。
+    }
+    
+    
+    // 忽略。。。
+}
+```
+在preBusinessCode()方法中会解析TccTransaction注解从而获得executeClass、confirmMethod、cancelMethod、MethodParameter和MethodTypeParameter信息，并构建TccTransactionInfo对象。
+## 2、clear()
+```
+@Component
+public class TccTransactionCleanService implements TransactionCleanService {
+
+    // 忽略。。。
+
+    @Override
+    public void clear(String groupId, int state, String unitId, String unitType) throws TransactionClearException {
+        Method exeMethod;
+        try {
+            // 忽略。。。
+            
+            exeMethod = tccInfo.getExecuteClass().getMethod(state == 1 ? tccInfo.getConfirmMethod() : tccInfo.getCancelMethod(), tccInfo.getMethodTypeParameter());
+            try {
+                exeMethod.invoke(object, ccInfo.getMethodParameter());
+            } catch (Throwable e) {
+                // 忽略。。。
+            }
+        } catch (Throwable e) {
+            throw new TransactionClearException(e.getMessage());
+        } finally {
+            // 忽略。。。
+/            
+        }
+    }
+}
+```
+根据state值决定执行confirmMethod还cancelMethod。
+## 3、TccTransactionResourceProxy
+```
+@Service(value = "transaction_tcc")
+public class TccTransactionResourceProxy implements TransactionResourceProxy {
+
+    @Override
+    public Connection proxyConnection(ConnectionCallback connectionCallback) throws Throwable {
+        return connectionCallback.call();
+    }
+}
+```
+可见，TCC模式并没有对java.sql.Connection进行代理，即本地事务每次都会真实commit/rollback/close。
+# 五、TXC模式
+这种模式的实现原理与前两种模式的实现原理有很大的不同，TXC模式的实现原理为：在执行SQL之前，先查询出此条SQL将影响的数据，然后锁住并保存这些数据（UndoLog），当需要回滚的时候就用保存的UndoLog回滚数据库。（请参考[https://www.txlcn.org/zh-cn/docs/principle/txc.html](https://www.txlcn.org/zh-cn/docs/principle/txc.html)）
+入口类PreparedStatementWrapper:
+```
+public class PreparedStatementWrapper extends StatementWrapper implements PreparedStatement {
+    // 忽略。。。
+    
+    public boolean execute() throws SQLException {
+		SQLException e = null;
+		long start = System.nanoTime();
+		try {
+			eventListener.onBeforeExecute(statementInformation);
+			return delegate.execute();
+		} catch (SQLException sqle) {
+			e = sqle;
+			throw e;
+		} finally {
+			eventListener.onAfterExecute(statementInformation, System.nanoTime() - start, e);
+		}
+	}
+
+	public int executeUpdate() throws SQLException {
+		SQLException e = null;
+		long start = System.nanoTime();
+		int rowCount = 0;
+		try {
+			eventListener.onBeforeExecuteUpdate(statementInformation);
+			rowCount = delegate.executeUpdate();
+			return rowCount;
+		} catch (SQLException sqle) {
+			e = sqle;
+			throw e;
+		} finally {
+			eventListener.onAfterExecuteUpdate(statementInformation, System.nanoTime() - start, rowCount, e);
+		}
+	}
+
+	public ResultSet executeQuery() throws SQLException {
+		SQLException e = null;
+		long start = System.nanoTime();
+		ResultSet bakResultSet;
+		try {
+			eventListener.onBeforeExecuteQuery(statementInformation);
+			return ResultSetWrapper.wrap(delegate.executeQuery(), new ResultSetInformation(statementInformation), eventListener);
+		} catch (SQLException sqle) {
+			e = sqle;
+			throw e;
+		} finally {
+			eventListener.onAfterExecuteQuery(statementInformation, System.nanoTime() - start, e);
+		}
+	}
+	
+	// 忽略。。。
+}
+```
+以上是该类众多方法中典型的三个，该类继承并代理了PreparedStatement，会在执行每条sql之前或之后织入TXC的事务逻辑。下面我们重点关注execute()方法，它有3个方法：onBeforeExecute()、execute()和onAfterExecute()，我们依次来看看这3个方法的实现逻辑。
+## 1、onBeforeExecute()
+我们跟进eventListener.onBeforeExecute()方法，来到TxcJdbcEventListener.onBeforeAnyExecute()方法：
+```
+public String onBeforeAnyExecute(StatementInformation statementInformation) throws SQLException {
+    String sql = statementInformation.getSqlWithValues();
+
+    // 当前业务链接        DTXLocalContext.cur().setResource(statementInformation.getStatement().getConnection());
+
+    // 拦截处理
+    try {
+        Statement statement = CCJSqlParserUtil.parse(sql);
+        log.debug("statement > {}", statement);
+        statementInformation.setAttachment(statement);
+        if (statement instanceof Update) {
+            sqlExecuteInterceptor.preUpdate((Update) statement);
+        } else if (statement instanceof Delete) {
+            sqlExecuteInterceptor.preDelete((Delete) statement);
+        } else if (statement instanceof Insert) {
+            sqlExecuteInterceptor.preInsert((Insert) statement);
+        } else if (statement instanceof Select) {
+            sqlExecuteInterceptor.preSelect(new LockableSelect((Select) statement));
+        }
+    } catch (JSQLParserException e) {
+        throw new SQLException(e);
+    }
+    return sql;
+}
+根据Statement的具体类型进入相应的pre逻辑，我们这里跟进sqlExecuteInterceptor.preUpdate((Update) statement)，来到TxcService.resolveUpdateImage(updateImageParams)方法：
+public void resolveUpdateImage(UpdateImageParams updateImageParams) throws TxcLogicException {
+    // 前置镜像数据集
+    List<ModifiedRecord> modifiedRecords;
+    Connection connection = (Connection) DTXLocalContext.cur().getResource();
+    try {
+        modifiedRecords = txcSqlExecutor.updateSqlPreviousData(connection, updateImageParams);
+    } catch (SQLException e) {
+        throw new TxcLogicException(e);
+    }
+
+    resolveModifiedRecords(modifiedRecords, SqlUtils.SQL_TYPE_UPDATE);
+}
+```
+先跟进txcSqlExecutor.updateSqlPreviousData()方法：
+```
+public List<ModifiedRecord> updateSqlPreviousData(Connection connection, UpdateImageParams updateImageParams)
+        throws SQLException {
+    // 前置镜像sql
+    String beforeSql = SqlUtils.SELECT
+            + String.join(SqlUtils.SQL_COMMA_SEPARATOR, updateImageParams.getColumns())
+            + SqlUtils.SQL_COMMA_SEPARATOR
+            + String.join(SqlUtils.SQL_COMMA_SEPARATOR, updateImageParams.getPrimaryKeys())
+            + SqlUtils.FROM
+            + String.join(SqlUtils.SQL_COMMA_SEPARATOR, updateImageParams.getTables())
+            + SqlUtils.WHERE
+            + updateImageParams.getWhereSql();
+    return queryRunner.query(connection, beforeSql,
+            new TxcModifiedRecordListHandler(updateImageParams.getPrimaryKeys(), updateImageParams.getColumns()));
+}
+```
+先构建sql，然后Select出当前这条sql将会影响到的数据。
+再跟进resolveModifiedRecords方法：
+```
+private void resolveModifiedRecords(List<ModifiedRecord> modifiedRecords, int sqlType) throws TxcLogicException {
+
+    TableRecordList tableRecords = new TableRecordList();
+    Set<String> lockIdSet = new HashSet<>();
+
+    // Build reverse sql
+    for (ModifiedRecord modifiedRecord : modifiedRecords) {
+        for (Map.Entry<String, FieldCluster> entry : modifiedRecord.getFieldClusters().entrySet()) {
+            TableRecord tableRecord = new TableRecord();
+            tableRecord.setTableName(entry.getKey());
+            tableRecord.setFieldCluster(entry.getValue());
+            tableRecords.getTableRecords().add(tableRecord);           lockIdSet.add(hex(tableRecord.getFieldCluster().getPrimaryKeys().toString()));
+        }
+    }
+
+    // 受影响记录为0
+    if (lockIdSet.isEmpty()) {
+        return;
+    }
+
+    String groupId = DTXLocalContext.cur().getGroupId();
+    String unitId = DTXLocalContext.cur().getUnitId();
+
+    // lock
+    lockDataLine(groupId, unitId, lockIdSet, true);
+
+    // save to h2db
+    saveUndoLog(groupId, unitId, sqlType, tableRecords);
+}
+```
+锁住这条sql将影响到的记录，并持久化这些记录。我们先跟进lockDataLine()方法：
+```
+private void lockDataLine(String groupId, String unitId, Set<String> lockIdSet, boolean isXLock) throws TxcLogicException {
+    try {
+        if (!reliableMessenger.acquireLocks(groupId, lockIdSet, isXLock ? DTXLocks.X_LOCK : DTXLocks.S_LOCK)) {
+            throw new TxcLogicException("resource is locked! place try again later.");
+        }
+        globalContext.addTxcLockId(groupId, unitId, lockIdSet);
+    } catch (RpcException e) {
+        throw new TxcLogicException("can't contact to any TM for lock info. default error.");
+    }
+}
+```
+先尝试获取锁，若获取失败则说明这些记录被其它分布式事务锁住了，本次事务失败；否则成功获取锁。reliableMessenger.acquireLocks()方法会通过Netty向TM发送一条获取分布式事务锁的消息，我们看下TM侧接收到该消息后的处理逻辑，我们来到FastStorage.acquireLocks()方法：
+```
+public void acquireLocks(String contextId, Set<String> locks, LockValue lockValue, String groupId) throws FastStorageException {
+    // 未申请锁则为申请正常
+    if (Objects.isNull(locks) || locks.isEmpty()) {
+        return;
+    }
+    Map<String, LockValue> lockIds = locks.stream().collect(Collectors.toMap(lock -> contextId + lock, lock -> lockValue));
+    String firstLockId = contextId + new ArrayList<>(locks).get(0);
+    Boolean result = redisTemplate.opsForValue().multiSetIfAbsent(lockIds);
+    if (!Optional.ofNullable(result).orElse(false)) {
+        LockValue hasLockValue = (LockValue) redisTemplate.opsForValue().get(firstLockId);
+        if (Objects.isNull(hasLockValue)) {
+            throw new FastStorageException("acquire locks fail.", FastStorageException.EX_CODE_REPEAT_LOCK);
+        }
+        // 不在同一个DTX下，已存在的锁是排它锁 或者 新请求的不是共享锁时， 获取锁失败
+        if (Objects.isNull(lockValue.getGroupId()) || !lockValue.getGroupId().equals(hasLockValue.getGroupId())) {
+            if (hasLockValue.getLockType() == DTXLocks.X_LOCK || lockValue.getLockType() != DTXLocks.S_LOCK) {
+                throw new FastStorageException("acquire locks fail.", FastStorageException.EX_CODE_REPEAT_LOCK);
+            }
+        }
+        redisTemplate.opsForValue().multiSet(lockIds);
+    }
+
+    // 锁超时时间设置
+    long dtxTime = getDtxTime(groupId);
+    lockIds.forEach((k, v) -> redisTemplate.expire(k, dtxTime, TimeUnit.MILLISECONDS));
+}
+```
+先尝试执行multiSetIfAbsent(lockIds)，若返回false，则说明已有事务把这些记录锁住了，于是判断：若锁住这些记录的是其它的分布式事务，且是非共享锁（如排它锁），则当前事务获取锁失败，否则当前事务也可以获取到锁，所以这是把可重入锁。
+
+我们继续回到resolveModifiedRecords()方法，看下saveUndoLog()方法的实现：
+```
+public void saveUndoLog(UndoLogDO undoLogDO) throws SQLException {
+    String sql = "INSERT INTO TXC_UNDO_LOG (UNIT_ID,GROUP_ID,SQL_TYPE,ROLLBACK_INFO,CREATE_TIME) VALUES(?,?,?,?,?)";
+    h2DbHelper.queryRunner().update(sql, undoLogDO.getUnitId(), undoLogDO.getGroupId(), undoLogDO.getSqlType(),
+            undoLogDO.getRollbackInfo(), undoLogDO.getCreateTime());
+}
+```
+会把当前sql影响到的记录持久化到H2内存数据库里。
+至此onBeforeExecute()方法分析完毕，大致流程为：先Select出当前sql将会影响到的Records，然后锁住这些Records并持久化到数据库，以便事务失败时利用这些持久化的UndoLog回滚数据库。
+## 2、execute()
+```
+public boolean execute() throws SQLException {
+    SQLException e = null;
+    long start = System.nanoTime();
+    try {
+        eventListener.onBeforeExecute(statementInformation);
+        return delegate.execute();
+    } catch (SQLException sqle) {
+        e = sqle;
+        throw e;
+    } finally {
+        eventListener.onAfterExecute(statementInformation, System.nanoTime() - start, e);
+    }
+}
+```
+delegate.execute()执行真实的业务sql语句。
+## 3、onAfterExecute()
+我们跟进eventListener.onAfterExecute()，来到TxcJdbcEventListener.onAfterExecute()方法：
+```
+public void onAfterExecute(PreparedStatementInformation statementInformation, long timeElapsedNanos, SQLException e) {
+    if (statementInformation.getAttachment() instanceof Insert) {
+        try {
+            sqlExecuteInterceptor.postInsert(statementInformation);
+        } catch (SQLException e1) {
+            throw new RuntimeException(e1);
+        }
+    }
+}
+```
+与onBeforeAnyExecute()会对具体不同的Statement执行不同的pre操作形成对比的是，onAfterExecute()方法只对Insert类型的Statement进行post操作，那么我们返回onBeforeAnyExecute()看下它的preInsert()的实现逻辑：
+```
+public void preInsert(Insert insert) {
+}
+```
+该方法什么都没做，所以onBeforeAnyExecute()和onAfterExecute()两个方法形成互补，其它语句会执行pre操作，而Inert语句会执行post操作。
+我们跟进sqlExecuteInterceptor.postInsert()方法，来到TxcServiceImpl.resolveInsertImage()方法：
+```
+public void resolveInsertImage(InsertImageParams insertImageParams) throws TxcLogicException {
+    List<FieldValue> primaryKeys = new ArrayList<>();
+    FieldCluster fieldCluster = new FieldCluster();
+    fieldCluster.setPrimaryKeys(primaryKeys);
+    ResultSet resultSet = null;
+    try {
+        resultSet = insertImageParams.getStatement().getGeneratedKeys();
+    } catch (SQLException ignored) {
+        // ignored non gen key.
+    }
+    try {
+        for (int i = 0; i < insertImageParams.getPrimaryKeyValuesList().size(); i++) {
+            Map<String, Object> pks = insertImageParams.getPrimaryKeyValuesList().get(i);
+            for (String key : insertImageParams.getFullyQualifiedPrimaryKeys()) {
+                FieldValue fieldValue = new FieldValue();
+                fieldValue.setFieldName(key);
+                if (pks.containsKey(key)) {
+                    fieldValue.setValue(pks.get(key));
+                } else if (Objects.nonNull(resultSet)) {
+                    try {
+                        resultSet.next();
+                        fieldValue.setValue(resultSet.getObject(1));
+                    } catch (SQLException ignored) {
+                    }
+                }
+                primaryKeys.add(fieldValue);
+            }
+        }
+    } finally {
+        try {
+            DbUtils.close(resultSet);
+        } catch (SQLException ignored) {
+        }
+    }
+
+    // save to db
+    TableRecordList tableRecords = new TableRecordList();
+    tableRecords.getTableRecords().add(new TableRecord(insertImageParams.getTableName(), fieldCluster));
+    saveUndoLog(DTXLocalContext.cur().getGroupId(), DTXLocalContext.cur().getUnitId(), SqlUtils.SQL_TYPE_INSERT, tableRecords);
+}
+```
+将当前Insert的Records持久化到UndoLog。注意，Insert操作没有锁住记录，没有必要。
+## 4、rollback
+下面我们分析TXC模式下事务回滚的逻辑。事务会在以下场景进行回滚：
+1）本地业务逻辑执行失败；
+2）通过RPC调用其它服务失败；
+3）TM通知TC进行回滚。
+但不管哪种场景导致的回滚，最终都会来到TxcTransactionCleanService.clear()方法：
+```
+public void clear(String groupId, int state, String unitId, String unitType) throws TransactionClearException {
+    boolean rethrowTxcException = false;
+    try {
+        // 若需要回滚读undo_log，进行回滚
+        if (state == 0) {
+            txcService.undo(groupId, unitId);
+        }
+    } catch (TxcLogicException e) {
+        // 忽略。。。
+    }
+
+    try {
+        // 清理TXC
+        txcService.cleanTxc(groupId, unitId);
+    } catch (TxcLogicException e) {
+        throw new TransactionClearException(e);
+    }
+
+    // 忽略。。。
+}
+```
+若state==0则先回滚数据，然后清理TXC相关的资源。我们先看txcService.undo()方法：
+```
+public void undo(String groupId, String unitId) throws TxcLogicException {
+    DTXLocalContext.makeUnProxy();
+    List<StatementInfo> statementInfoList = new ArrayList<>();
+    try {
+        List<UndoLogDO> undoLogDOList = txcLogHelper.getUndoLogByGroupAndUnitId(groupId, unitId);
+
+        for (UndoLogDO undoLogDO : undoLogDOList) {
+            TableRecordList tableRecords = SqlUtils.blobToObject(undoLogDO.getRollbackInfo(), TableRecordList.class);
+            switch (undoLogDO.getSqlType()) {
+                case SqlUtils.SQL_TYPE_UPDATE:
+                    tableRecords.getTableRecords().forEach(tableRecord -> statementInfoList.add(UndoLogAnalyser.update(tableRecord)));
+                    break;
+                case SqlUtils.SQL_TYPE_DELETE:
+                    tableRecords.getTableRecords().forEach(tableRecord -> statementInfoList.add(UndoLogAnalyser.delete(tableRecord)));
+                    break;
+                case SqlUtils.SQL_TYPE_INSERT:
+                    tableRecords.getTableRecords().forEach(tableRecord -> statementInfoList.add(UndoLogAnalyser.insert(tableRecord)));
+                    break;
+                default:
+                    break;
+            }
+        }
+        txcSqlExecutor.applyUndoLog(statementInfoList);
+    } catch (SQLException e) {
+        TxcLogicException exception = new TxcLogicException(e);
+        exception.setAttachment(statementInfoList);
+        throw exception;
+    } finally {
+        DTXLocalContext.undoProxyStatus();
+    }
+}
+```
+大致流程为：先从数据库中Select出当前GroupId+UnitId下的UndoLog，然后遍历这些UndoLog构建出StatementInfo集合，最后利用StatementInfo集合执行逆向SQL来回滚数据库。
+我们看几个核心方法，先看txcLogHelper.getUndoLogByGroupAndUnitId(groupId, unitId)：
+```
+public List<UndoLogDO> getUndoLogByGroupAndUnitId(String groupId, String unitId) throws SQLException {
+    String sql = "SELECT * FROM TXC_UNDO_LOG WHERE GROUP_ID = ? and UNIT_ID = ?";
+    return h2DbHelper.queryRunner().query(sql, rs -> {
+        List<UndoLogDO> undoLogDOList = new ArrayList<>();
+        while (rs.next()) {
+            UndoLogDO undoLogDO = new UndoLogDO();
+            undoLogDO.setSqlType(rs.getInt("SQL_TYPE"));
+            undoLogDO.setRollbackInfo(rs.getBytes("ROLLBACK_INFO"));
+            undoLogDO.setUnitId(rs.getString("UNIT_ID"));
+            undoLogDO.setGroupId("GROUP_ID");
+            undoLogDO.setCreateTime(rs.getString("CREATE_TIME"));
+            undoLogDOList.add(undoLogDO);
+        }
+        return undoLogDOList;
+    }, groupId, unitId);
+}
+```
+从数据库中Select出当前GroupId+UnitId下的UndoLog。
+再看UndoLogAnalyser.*update*(tableRecord)方法：
+```
+public static StatementInfo update(TableRecord tableRecord) {
+    String k = tableRecord.getTableName();
+    FieldCluster v = tableRecord.getFieldCluster();
+    Object[] params = new Object[v.getFields().size() + v.getPrimaryKeys().size()];
+
+    StringBuilder rollbackSql = new StringBuilder()
+            .append(SqlUtils.UPDATE)
+            .append(k)
+            .append(SqlUtils.SET);
+    int index = 0;
+    for (int i = 0; i < v.getFields().size(); i++, index++) {
+        FieldValue fieldValue = v.getFields().get(i);
+        rollbackSql.append(fieldValue.getFieldName())
+                .append("=?")
+                .append(SqlUtils.SQL_COMMA_SEPARATOR);
+        params[index] = fieldValue.getValue();
+    }
+    SqlUtils.cutSuffix(SqlUtils.SQL_COMMA_SEPARATOR, rollbackSql);
+    rollbackSql.append(SqlUtils.WHERE);
+    int j = whereBuilder(v.getPrimaryKeys(), rollbackSql, params, index - 1);
+    SqlUtils.cutSuffix(SqlUtils.AND, rollbackSql);
+    return new StatementInfo(rollbackSql.toString(), Arrays.copyOf(params, j));
+}
+```
+利用上面从数据库中Select出的TableRecord构建StatementInfo对象，我们看到StatementInfo封装了rollbackSql（带占位符）和参数值，后面就能利用该对象构建一条完整的rollbackSql。
+
+最后我们再看下undo()方法的txcSqlExecutor.applyUndoLog(statementInfoList)方法：
+```
+public void applyUndoLog(List<StatementInfo> statementInfoList) throws SQLException {
+    Connection connection = null;
+    try {
+        connection = queryRunner.getDataSource().getConnection();
+        connection.setAutoCommit(false);
+        for (StatementInfo statementInfo : statementInfoList) {
+            log.debug("txc > Apply undo log. sql: {}, params: {}", statementInfo.getSql(), statementInfo.getParams());
+            queryRunner.update(connection, statementInfo.getSql(), statementInfo.getParams());
+        }
+        connection.commit();
+    } catch (SQLException e) {
+        if (connection != null) {
+            connection.rollback();
+        }
+        throw e;
+    } finally {
+        if (connection != null) {
+            connection.setAutoCommit(true);
+            DbUtils.close(connection);
+        }
+    }
+}
+```
+先将autoCommit设置为false，然后一条条执行逆向回滚sql，最后commit这些sql，并将autoCommit重新设回true。
+
+分析完TxcTransactionCleanService.clear()中的txcService.undo(groupId, unitId)方法，我们再继续跟进txcService.cleanTxc(groupId, unitId)方法：
+```
+public void cleanTxc(String groupId, String unitId) throws TxcLogicException {
+    // 清理事务单元相关锁
+    try {        reliableMessenger.releaseLocks(globalContext.findTxcLockSet(groupId, unitId));
+    } catch (RpcException e) {
+        throw new TxcLogicException(e);
+    } catch (TCGlobalContextException e) {
+        // ignored, if non lock to release.
+    }
+
+    // 清理事务单元相关undo_log
+    try {
+        txcLogHelper.deleteUndoLog(groupId, unitId);
+    } catch (SQLException e) {
+        throw new TxcLogicException(e);
+    }
+}
+```
+先释放锁，再删除UndoLog。先跟进reliableMessenger.releaseLocks()方法：
+```
+public void releaseLocks(Set<String> lockIdList) throws RpcException {
+    MessageDto messageDto = request(MessageCreator.releaseLocks(lockIdList));
+    if (!MessageUtils.statusOk(messageDto)) {
+        throw new RpcException("release locks fail.");
+    }
+}
+```
+会构建一条释放分布式锁的消息，并通过Netty发送给TM。我们看下TM接收到这条消息后的执行逻辑：
+```
+public void releaseLocks(String cate, Set<String> locks) {
+    redisTemplate.delete(locks.stream().map(lock -> (cate + lock)).collect(Collectors.toSet()));
+}
+```
+删除redis里的锁记录。
+
+分析完reliableMessenger.releaseLocks()方法，我们再继续跟进txcLogHelper.deleteUndoLog(groupId, unitId)方法：
+```
+public void deleteUndoLog(String groupId, String unitId) throws SQLException {
+    String sql = "DELETE FROM TXC_UNDO_LOG WHERE GROUP_ID=? AND UNIT_ID=?";
+    h2DbHelper.queryRunner().update(sql, groupId, unitId);
+}
+```
+删除数据库中的UndoLog。
+至此我们知道，TXC模式下的回滚做了3件事：
+1）利用UndoLog执行回滚sql；
+2）释放当前事务锁住的记录；
+3）删除UndoLog。
