@@ -3,8 +3,8 @@
 * [README](/README.md)
 * Apollo
   * [简介](/Apollo/简介.md)
-  * [示例](/Spring Cloud/Gateway/示例)
-  * [工作机制](/Spring Cloud/Gateway/工作机制)
+  * [示例](/Apollo/示例.md)
+  * [工作机制](/Apollo/工作机制.md)
   * [源码解析](/Apollo/源码解析.md)
 * Spring Cloud
   * Gateway
