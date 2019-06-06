@@ -20,7 +20,7 @@
 * LCN
   * [简介](jian-jie.md)
   * [示例](shi-li.md)
-  * 工作机制
+  * [工作机制](gong-zuo-ji-zhi.md)
   * 源码解析
 * docker
   * [简介](jian-jie.md)
