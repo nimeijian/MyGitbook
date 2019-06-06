@@ -14,7 +14,7 @@
     * [源码解析](Spring Cloud/Gateway/源码解析.md)
   * Nacos
     * [简介](Spring Cloud/Nacos/简介.md)
-    * 示例(Spring Cloud/Nacos/示例.md)
+    * [示例](Spring Cloud/Nacos/示例.md)
     * [工作机制](Spring Cloud/Nacos/工作机制.md)
     * [源码解析](Spring Cloud/Nacos/源码解析.md)
 * LCN
